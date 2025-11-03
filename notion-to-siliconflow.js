@@ -1,24 +1,31 @@
 // notion-to-siliconflow.js
-// 依赖：npm i @notionhq/client axios p-limit dotenv
+// 依赖：npm i @notionhq/client axios dotenv p-limit
 import 'dotenv/config';
 import { Client } from '@notionhq/client';
 import axios from 'axios';
 import pLimit from 'p-limit';
 
-// 1) ENV（你指定的命名）
+// ===== 运行参数（可用 GitHub Secrets 注入覆盖）=====
+const MAX_PER_RUN = Number(process.env.MAX_PER_RUN || 100); // 每次最多处理 N 条
+const CONCURRENCY = Number(process.env.CONCURRENCY || 4);   // 并发请求数
+const IMG_WIDTH = Number(process.env.IMG_WIDTH || 768);
+const IMG_HEIGHT = Number(process.env.IMG_HEIGHT || 1024);
+const IMG_STEPS = Number(process.env.IMG_STEPS || 25);
+const IMG_GUIDANCE = Number(process.env.IMG_GUIDANCE || 7);
+
+// ===== Notion & SiliconFlow 基础配置 =====
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
 
-// 2) SiliconFlow 端点与模型（可用 ENV 覆盖端点）
-// 若你在 Secrets 中提供 SILICONFLOW_IMAGE_API，这里会自动覆盖默认端点
+// 端点可通过环境覆盖；默认给出常见 API（如与你账号不符，可在 Secrets 配置 SILICONFLOW_IMAGE_API）
 const SILICONFLOW_IMAGE_API =
   process.env.SILICONFLOW_IMAGE_API ||
   'https://api.siliconflow.cn/v1/images/generations';
 
-const MODEL = 'Qwen/Qwen-Image';
+const MODEL = process.env.SILICONFLOW_MODEL || 'Qwen/Qwen-Image';
 
-// 3) 字段名（与数据源 schema 完全对齐）
+// ===== 数据源字段（与“📹 镜头脚本分镜库”对齐）=====
 const FIELD = {
   TITLE: '名称',               // title
   PROMPT: '画面描述',           // text（API 返回 rich_text）
@@ -36,15 +43,13 @@ const FIELD = {
   TRANSITION: '转场',           // text
   PERSONS: '人员',             // rollup（只读）
   RELATION_CONTENT: '关联内容',  // relation（跨库）
-  STATUS: '拍摄进度',           // status（枚举）
+  STATUS: '拍摄进度',           // status（不写，仅可选过滤）
   ORDER: '顺序',               // number
+  FILE_AI: 'Ai构图',           // file（写回目标）
   READONLY_ROLLUP: '内容状态'   // rollup（只读）
 };
 
-// 4) 状态枚举（仅用于可选过滤，不写回）
-const PROGRESS = new Set(['待拍','已拍摄','补拍镜头','拍摄中','剪辑中','已完成','淘汰']);
-
-// 5) 通用取值（覆盖 title/rich_text/select/multi_select/number/date/status/rollup）
+// ===== 通用取值（覆盖 title/rich_text/select/multi_select/number/date/status/rollup）=====
 function getTextValue(prop) {
   if (!prop) return '';
   switch (prop.type) {
@@ -71,10 +76,8 @@ function getTextValue(prop) {
     case 'rollup': {
       const r = prop.rollup;
       if (!r) return '';
-      // 常见 rollup 聚合类型处理
       if (r.type === 'array' && Array.isArray(r.array)) {
         const items = r.array.map(it => {
-          // it 的结构为 { type: 'title'|'rich_text'|..., <sameKey>: [...] }
           const t = it[it.type];
           if (!t) return '';
           if (Array.isArray(t)) return t.map(x => x.plain_text || '').join(' ').trim();
@@ -92,36 +95,34 @@ function getTextValue(prop) {
   }
 }
 
-// 6) 组合“整条分镜”的结构化提示词：主描述 + 其余标签化信息
+// ===== 构建提示词（整合全部字段为正向提示；负向提示统一降噪）=====
 function buildPrompt(page) {
   const p = page.properties || {};
   const F = FIELD;
 
-  // 主体与补充
-  const name = getTextValue(p[F.TITLE]);            // 名称
-  const desc = getTextValue(p[F.PROMPT]);           // 画面描述（主提示）
-  const cam = getTextValue(p[F.CAM_POS]);           // 机位
-  const lens = getTextValue(p[F.LENS]);             // 镜头
-  const pov = getTextValue(p[F.POV]);               // 视角
-  const subtitle = getTextValue(p[F.SUBTITLE]);     // 字幕/屏幕要点
-  const propsMat = getTextValue(p[F.PROPS]);        // 道具/素材
-  const seg = getTextValue(p[F.SEGMENT]);           // 段落
-  const location = getTextValue(p[F.LOCATION]);     // 拍摄地点
-  const duration = getTextValue(p[F.DURATION]);     // 时长（秒）
-  const bgm = getTextValue(p[F.BGM]);               // BGM
-  const vo = getTextValue(p[F.VO]);                 // 台词/旁白
-  const cta = getTextValue(p[F.CTA]);               // CTA
-  const transition = getTextValue(p[F.TRANSITION]); // 转场
-  const persons = getTextValue(p[F.PERSONS]);       // 人员（rollup 名称/计数）
+  const name = getTextValue(p[F.TITLE]);
+  const desc = getTextValue(p[F.PROMPT]);
+  const cam = getTextValue(p[F.CAM_POS]);
+  const lens = getTextValue(p[F.LENS]);
+  const pov = getTextValue(p[F.POV]);
+  const subtitle = getTextValue(p[F.SUBTITLE]);
+  const propsMat = getTextValue(p[F.PROPS]);
+  const seg = getTextValue(p[F.SEGMENT]);
+  const location = getTextValue(p[F.LOCATION]);
+  const duration = getTextValue(p[F.DURATION]);
+  const bgm = getTextValue(p[F.BGM]);
+  const vo = getTextValue(p[F.VO]);
+  const cta = getTextValue(p[F.CTA]);
+  const transition = getTextValue(p[F.TRANSITION]);
+  const persons = getTextValue(p[F.PERSONS]);
 
-  // 关联内容仅提供数量提示，避免跨库深查
+  // 关联内容仅统计数量，避免跨库深查
   let relatedCount = '';
   const relProp = p[F.RELATION_CONTENT];
   if (relProp?.type === 'relation' && Array.isArray(relProp.relation)) {
     relatedCount = `关联内容：${relProp.relation.length} 项`;
   }
 
-  // 拼装正向提示（结构化）
   const lines = [
     desc && `画面描述：${desc}`,
     name && `名称：${name}`,
@@ -141,7 +142,6 @@ function buildPrompt(page) {
     relatedCount
   ].filter(Boolean);
 
-  // 统一的风格与质量基线
   lines.push('风格：写实高清，主体明确，构图简洁，光线自然，社媒短视频友好');
 
   const positive = lines.join('；');
@@ -150,26 +150,36 @@ function buildPrompt(page) {
   return { prompt: positive, negativePrompt: negative };
 }
 
-// 7) 查询页面：画面描述非空 + 可选（拍摄进度=待拍），并按“顺序”升序
-async function queryPages({ onlyTodo = true, pageSize = 10 } = {}) {
-  const filters = [
-    { property: FIELD.PROMPT, rich_text: { is_not_empty: true } }
-  ];
-  if (onlyTodo) {
-    filters.push({ property: FIELD.STATUS, status: { equals: '待拍' } });
+// ===== 全库扫描：仅处理 “Ai构图为空 & 画面描述非空” 的条目 =====
+async function queryPagesAllEmptyAi({ pageSize = 50 } = {}) {
+  const pages = [];
+  let cursor;
+
+  while (true) {
+    const resp = await notion.databases.query({
+      database_id: DATABASE_ID,
+      start_cursor: cursor,
+      filter: {
+        and: [
+          { property: FIELD.FILE_AI, files: { is_empty: true } },
+          { property: FIELD.PROMPT, rich_text: { is_not_empty: true } }
+          // 如需限制只处理“待拍”，可追加：
+          // { property: FIELD.STATUS, status: { equals: '待拍' } }
+        ]
+      },
+      sorts: [{ property: FIELD.ORDER, direction: 'ascending' }],
+      page_size: pageSize
+    });
+
+    pages.push(...resp.results);
+    if (!resp.has_more) break;
+    cursor = resp.next_cursor;
   }
 
-  const resp = await notion.databases.query({
-    database_id: DATABASE_ID,
-    filter: { and: filters },
-    sorts: [{ property: FIELD.ORDER, direction: 'ascending' }],
-    page_size: pageSize
-  });
-
-  return resp.results || [];
+  return pages;
 }
 
-// 8) 带重试封装（处理 429/5xx/超时）
+// ===== 带重试封装（处理 429/5xx/超时）=====
 async function callWithRetry(fn, { retries = 2, baseDelay = 800 } = {}) {
   let attempt = 0;
   while (true) {
@@ -186,9 +196,9 @@ async function callWithRetry(fn, { retries = 2, baseDelay = 800 } = {}) {
   }
 }
 
-// 9) 生成图片：返回首个可用 URL（宽容解析多个常见字段）
+// ===== 生成图片：返回首个可用 URL（兼容多种返回结构）=====
 async function generateImage(prompt, negativePrompt, {
-  width = 768, height = 1024, steps = 25, guidance_scale = 7
+  width = IMG_WIDTH, height = IMG_HEIGHT, steps = IMG_STEPS, guidance_scale = IMG_GUIDANCE
 } = {}) {
   if (!prompt) throw new Error('空提示词：画面描述为空。');
 
@@ -225,33 +235,50 @@ async function generateImage(prompt, negativePrompt, {
   return candidates[0] || null;
 }
 
-// 10) 主流程：只读 Notion，生成图，输出 results.json（不写回）
+// ===== 写回到 Notion「Ai构图」（覆盖为最新一张 external）=====
+async function writeBackImageToNotion(pageId, imageUrl, { propertyName = FIELD.FILE_AI, fileName = '参考图.jpg' } = {}) {
+  if (!imageUrl) return;
+  await notion.pages.update({
+    page_id: pageId,
+    properties: {
+      [propertyName]: {
+        files: [
+          {
+            name: fileName,
+            external: { url: imageUrl }
+          }
+        ]
+      }
+    }
+  });
+}
+
+// ===== 主流程：扫描全库空图 → 生成 → 写回 → 导出结果 =====
 async function main() {
-  // ENV 校验
   if (!process.env.NOTION_TOKEN) throw new Error('缺少 NOTION_TOKEN');
   if (!DATABASE_ID) throw new Error('缺少 NOTION_DATABASE_ID');
   if (!SILICONFLOW_API_KEY) throw new Error('缺少 SILICONFLOW_API_KEY');
 
-  // 默认只处理「待拍」+ 画面描述非空；如要全量，将 onlyTodo 改为 false
-  const pages = await queryPages({ onlyTodo: true, pageSize: 10 });
-  if (!pages.length) {
-    console.log('没有可处理的分镜（「待拍」且「画面描述」非空）。');
+  const all = await queryPagesAllEmptyAi({ pageSize: 50 });
+  if (!all.length) {
+    console.log('没有需要返图的条目（Ai构图非空或无画面描述）。');
     return;
   }
 
-  const batch = pages.slice(0, 5); // 首跑 5 条验证稳定性
-  const limit = pLimit(3);         // 并发 3
+  const targets = all.slice(0, MAX_PER_RUN);
+  console.log(`本次待处理：${targets.length} / 全部待处理：${all.length}`);
 
-  const results = await Promise.all(batch.map(page => limit(async () => {
+  const limit = pLimit(CONCURRENCY);
+  const results = await Promise.all(targets.map(page => limit(async () => {
     const pageId = page.id;
     const name = getTextValue(page.properties?.[FIELD.TITLE]) || pageId;
     const order = getTextValue(page.properties?.[FIELD.ORDER]);
-
     const { prompt, negativePrompt } = buildPrompt(page);
 
     try {
-      const url = await generateImage(prompt, negativePrompt, { width: 768, height: 1024 });
+      const url = await generateImage(prompt, negativePrompt);
       if (url) {
+        await writeBackImageToNotion(pageId, url, { fileName: `${name || pageId}.jpg` });
         console.log(JSON.stringify({ pageId, name, order, prompt, url }, null, 2));
         return { pageId, name, ok: true, url };
       } else {
@@ -265,7 +292,6 @@ async function main() {
     }
   })));
 
-  // 写出结果文件（Actions 会作为 artifact 保留）
   try {
     const fs = await import('node:fs');
     fs.writeFileSync('results.json', JSON.stringify(results, null, 2));
