@@ -3,7 +3,7 @@ name: Notion → SiliconFlow 返图
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 14 * * *' # 每天 22:00（上海时间≈UTC+8），GitHub 使用 UTC 时间
+    - cron: '*/5 * * * *' # 每5分钟运行一次（GitHub 使用 UTC 时间）
 
 jobs:
   run:
@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
+      - name: Install deps
         run: npm ci || npm i
 
       - name: Run generator
@@ -27,8 +27,15 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
-          # 如果你有自定义端点，请在仓库 Secrets 中新增后再取消下面的注释：
+          # 可选覆盖项（如不需要可删除下面几行）
           # SILICONFLOW_IMAGE_API: ${{ secrets.SILICONFLOW_IMAGE_API }}
+          # SILICONFLOW_MODEL: Qwen/Qwen-Image
+          # MAX_PER_RUN: "200"
+          # CONCURRENCY: "4"
+          # IMG_WIDTH: "768"
+          # IMG_HEIGHT: "1024"
+          # IMG_STEPS: "25"
+          # IMG_GUIDANCE: "7"
 
       - name: 上传结果
         uses: actions/upload-artifact@v4
